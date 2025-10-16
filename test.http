@@ -1,0 +1,6 @@
+GET http://localhost:34569 HTTP/1.1
+
+
+###
+
+GET http://localhost:34569/?classRegex=.*X570.*&nameRegex=.*Memory.*&getMinMaxAvg=1 HTTP/1.1
