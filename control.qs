@@ -9,6 +9,7 @@ function Controller()
     }
 
     installer.setValue("allUsers", "false");
+    installer.uninstallationStarted.connect(this, Controller.prototype.onUninstallationStarted);
     installer.uninstallationFinished.connect(this, Controller.prototype.onUninstallationFinished);
     installer.installationFinished.connect(this, Controller.prototype.onInstallationFinished);
 }
@@ -18,11 +19,25 @@ function getBaseRegistryPath() {
 }
 
 Controller.prototype.onUninstallationStarted = function () {
+    var args  = [
+        "stop",
+        "MyRsm"
+    ];
+    console.log(args)
+    var output = installer.execute("C:\\Windows\\SysWOW64\\sc.exe", args);
+    console.log(output)
 }
 Controller.prototype.onUninstallationFinished = function () {
     console.log('Executing onUninstallationFinished')
     if (installer.value("os") === "win" )
     {
+        var args  = [
+            "delete",
+            "MyRsm"
+        ];
+        console.log(args)
+        var output = installer.execute("C:\\Windows\\SysWOW64\\sc.exe", args);
+        console.log(output)
         var base = "WOW6432Node\\"
         var path = installer.value("HKEY_LOCAL_MACHINE\\SOFTWARE\\" + base + "Microsoft\\Windows\\CurrentVersion\\Uninstall\\" + installer.value("ProductUUID") + "\\InstallLocation")
         if (path === "")
@@ -51,6 +66,24 @@ Controller.prototype.onUninstallationFinished = function () {
 Controller.prototype.onInstallationFinished = function() {
     //windows -> update the registry entry for the installer to work properly
     if (installer.value("os") === "win") {
+        var args  = [
+            "create",
+            "MyRsm",
+            "binPath=",
+            installer.value("TargetDir") + "/bin/myrsm.exe",
+            "start=",
+            "auto"
+        ];
+        console.log(args)
+        var output = installer.execute("C:\\Windows\\SysWOW64\\sc.exe", args);
+        console.log(output)
+        var args  = [
+            "start",
+            "MyRsm"
+        ];
+        console.log(args)
+        var output = installer.execute("C:\\Windows\\SysWOW64\\sc.exe", args);
+        console.log(output)
         if (installer.value("allUsers") === "true") {
             if (installer.gainAdminRights()) {
                 var base = "WOW6432Node\\"

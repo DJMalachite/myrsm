@@ -47,7 +47,13 @@ if((DEFINED ENV{CI_JOB_ID}) AND (DEFINED ENV{CI_COMMIT_REF_SLUG}))
 else()
   set(PROJECT_VERSION_NAME "localbuild")
 endif()
+if (DEFINED ENV{CI_COMMIT_REF_SLUG})
+  set (BRANCH "$ENV{CI_COMMIT_REF_SLUG}")
+else()
+  set (BRANCH "localbuild")
+endif()
 add_definitions(-DVERSION=\"${VERSION}\")
+add_definitions(-DBRANCH=\"${BRANCH}\")
 add_definitions(-DPROJECT_VERSION_NAME=\"${PROJECT_VERSION_NAME}\")
 message("Building ${VERSION} ${PROJECT_VERSION_NAME}")
 set(COMMENT "${PROJECT_VERSION_NAME}")
@@ -55,7 +61,7 @@ set(COMMENT "${PROJECT_VERSION_NAME}")
 # Allow for a nice long message on all qDebug
 add_definitions(-DQT_MESSAGELOGCONTEXT)
 
-set(ORIGINALICONPNG ${CMAKE_CURRENT_SOURCE_DIR}/logo-sm.png)
+set(ORIGINALICONPNG ${CMAKE_CURRENT_SOURCE_DIR}/logo-rsm.png)
 set(ICONICO ${CMAKE_CURRENT_BINARY_DIR}/icon.ico)
 set(RC_FILE ${CMAKE_CURRENT_BINARY_DIR}/myrsm.rc)
 add_custom_command(
@@ -73,7 +79,12 @@ configure_file(myrsm.rc.in myrsm.rc @ONLY)
 
 find_package(Qt6 REQUIRED COMPONENTS Core HttpServer Network WebSockets)
 
-qt_add_executable(myrsm main.cpp MyRsm.cpp ${RC_FILE}) # Replace with your source files
+qt_add_executable(myrsm
+  main.cpp
+  MyRsm.cpp
+  logger.hpp
+  logger.cpp
+  ${RC_FILE})
 
 target_link_libraries(myrsm PRIVATE Qt6::Core Qt6::HttpServer Qt6::Network Qt6::WebSockets)
 
