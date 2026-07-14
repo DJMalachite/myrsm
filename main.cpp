@@ -31,6 +31,8 @@ void WINAPI ServiceCtrlHandler(DWORD ctrlCode);
 QCoreApplication *app = nullptr;
 quint16 tcpPortArg = 34567;
 quint16 wsPortArg = 34568;
+int pollIntervalMsArg = 250;
+constexpr int kMinPollIntervalMs = 50;
 bool runAsServiceFlag = false;
 bool stop = false;
 
@@ -44,6 +46,8 @@ void loadConfigFromCli(QStringList a) {
               "httpport" },
             { "wsport", QCoreApplication::translate("wsport", "The port the websocket server listens on."),
               "wsport" },
+            { "pollms", QCoreApplication::translate("main", "Shared memory poll interval in milliseconds (min 50, default 250)."),
+              "pollms" },
             verboseOption,
             consoleOption
     });
@@ -53,6 +57,14 @@ void loadConfigFromCli(QStringList a) {
         tcpPortArg = parser.value("httpport").toUShort();
     if (!parser.value("wsport").isEmpty())
         wsPortArg = parser.value("wsport").toUShort();
+    if (!parser.value("pollms").isEmpty()) {
+        int ms = parser.value("pollms").toInt();
+        if (ms < kMinPollIntervalMs) {
+            qWarning() << "--pollms" << ms << "is below the" << kMinPollIntervalMs << "ms minimum; clamping.";
+            ms = kMinPollIntervalMs;
+        }
+        pollIntervalMsArg = ms;
+    }
     if (parser.isSet(verboseOption)) {
         QTextStream(stdout) << VERSION << " " << PROJECT_VERSION_NAME << Qt::endl;
         stop = true;
@@ -66,7 +78,7 @@ void loadConfigFromCli(QStringList a) {
 
 int configure()
 {
-    auto rsm = new MyRsm(QCoreApplication::instance());
+    auto rsm = new MyRsm(pollIntervalMsArg, QCoreApplication::instance());
     auto server = new QTcpServer(QCoreApplication::instance());
     auto httpServer = new QHttpServer(QCoreApplication::instance());
     auto wsServer = new QWebSocketServer(QStringLiteral("MyRsm WebSocket Server"), QWebSocketServer::NonSecureMode, QCoreApplication::instance());

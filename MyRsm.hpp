@@ -27,7 +27,8 @@ public:
             double valueAvg;
     };
 
-    MyRsm(QObject* parent = nullptr);
+    explicit MyRsm(int pollIntervalMs = 250, QObject* parent = nullptr);
+    ~MyRsm();
     void poll();
     QJsonArray toJson(QList<std::pair<QString, QString>> filters = {});
 signals:
@@ -35,8 +36,10 @@ signals:
 private:
     QSharedMemory m_shm;
     QTimer m_timer;
-    HWiNFO_SENSORS_SHARED_MEM2 m_data;
     QList<Sensor> m_sensors;
     QList<ReadingData> m_readings;
     qint64 m_lastPollTime = 0;
+    HANDLE m_hwinfoMutex = nullptr;
+    bool m_attachFailWarned = false;
+    bool m_wasDead = false;
 };
