@@ -78,6 +78,7 @@ string(REPLACE "-" "_" CPACK_TAG "${PROJECT_NAME}_$ENV{CI_COMMIT_REF_SLUG}")
 configure_file(myrsm.rc.in myrsm.rc @ONLY)
 
 option(MYRSM_BUILD_APP "Build the myrsm executable (needs Qt HttpServer + WebSockets)" ON)
+option(MYRSM_BUILD_TESTS "Build the unit tests and the fixture renderer" ON)
 
 if(MSVC)
   # Sources contain UTF-8 text; don't depend on the build machine's code page.
@@ -96,6 +97,26 @@ add_library(myrsm_core STATIC
   PromExporter.cpp)
 target_include_directories(myrsm_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(myrsm_core PUBLIC Qt6::Core)
+
+if(MYRSM_BUILD_TESTS)
+  enable_testing()
+  find_package(Qt6 REQUIRED COMPONENTS Test)
+
+  qt_add_executable(tst_promexporter tests/tst_promexporter.cpp)
+  target_link_libraries(tst_promexporter PRIVATE myrsm_core Qt6::Test)
+  add_test(NAME tst_promexporter COMMAND tst_promexporter)
+  # Find the Qt DLLs when run from the build tree.
+  set_tests_properties(tst_promexporter PROPERTIES
+    ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:Qt6::Core>")
+
+  # Renders a MyRSM "/" JSON fixture through prom::render (driven by
+  # tools/run_parity.py against the reference connector).
+  qt_add_executable(myrsm_render_fixture
+    tests/render_fixture.cpp
+    tests/FixtureLoader.hpp
+    tests/FixtureLoader.cpp)
+  target_link_libraries(myrsm_render_fixture PRIVATE myrsm_core)
+endif()
 
 if(NOT MYRSM_BUILD_APP)
   return()

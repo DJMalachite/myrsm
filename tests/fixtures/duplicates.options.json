@@ -1,0 +1,7 @@
+[
+  {"name": "default"},
+  {"name": "exclude-gpu-between-duplicates", "exclude_classes": "gpu"},
+  {"name": "exclude-app-aida64", "exclude_apps": "aida"},
+  {"name": "include-clock-only", "include_sensors": "clock"},
+  {"name": "exclude-dimm", "exclude_sensors": "dimm"}
+]

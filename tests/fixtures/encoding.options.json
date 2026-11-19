@@ -1,0 +1,6 @@
+[
+  {"name": "default"},
+  {"name": "unicode-host-label", "host_label": "PC \"quoted\" \\ é\nnewline"},
+  {"name": "filter-unicode-case", "include_sensors": "älpha, i̇stanbul"},
+  {"name": "filter-mojibake-repaired", "include_sensors": "écran"}
+]
