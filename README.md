@@ -1,3 +1,5 @@
+Disclaimer: Very much a vibe coded, needed something quick and easy to translate data from HWINFO to a scrapeable endpoint for Prometheus and my own dashboards, if you find this and decide to use it please understand that AI has made significant changes to the work of qdel...
+
 # MyRsm
 
 MyRsm reads sensor data from [HWiNFO](https://www.hwinfo.com/)'s shared-memory interface on Windows
