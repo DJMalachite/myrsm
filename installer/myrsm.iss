@@ -566,8 +566,9 @@ begin
   CheckHealth;
 
   if InstallProblems <> '' then
-    SuppressibleMsgBox('Setup finished with problems:' + #13#10#13#10 + InstallProblems +
-                       #13#10#13#10 + 'Details are in the setup log.', mbError, MB_OK, IDOK);
+    { Note: no line may start with '#' (ISPP would read it as a directive). }
+    SuppressibleMsgBox('Setup finished with problems:' + #13#10#13#10 + InstallProblems + #13#10#13#10 +
+                       'Details are in the setup log.', mbError, MB_OK, IDOK);
 
   if OldServicePath <> '' then
     SuppressibleMsgBox('The MyRsm service used to run from:' + #13#10 + OldServicePath + #13#10#13#10 +
