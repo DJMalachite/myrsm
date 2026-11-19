@@ -157,6 +157,6 @@ myrsm.exe service <install|uninstall|start|stop|status>
 
 ## Licensing
 
-GPLv3 (see [LICENSE](LICENSE)). `myrsm.rc.in` marks the binary itself "Private use only" in its
-version resource — an unresolved inconsistency the owner still has to decide on; don't change it
-unilaterally. The installer shows the GPLv3 `LICENSE`.
+GPLv3 (see [LICENSE](LICENSE)), as in the original upstream repo; the owner confirmed it stays GPLv3.
+The version resource in `myrsm.rc.in` says "Licensed under the GNU GPL v3" (it used to say "Private
+use only"), and the installer shows the GPLv3 `LICENSE`. Keep all three consistent.
