@@ -9,142 +9,70 @@
 #include <QHttpServerResponse>
 #include <QHttpServerResponder>
 #include <QDateTime>
-#include <QSysInfo>
-#include <cmath>
+#include <QTextStream>
 #include <QWebSocketServer>
 #include <QWebSocket>
 #include <windows.h>
-#include <tchar.h>
+#include <thread>
 #include "logger.hpp"
-#include <QStandardPaths>
 
 using namespace Qt::Literals::StringLiterals;
 
+#include "Config.hpp"
 #include "MyRsm.hpp"
 #include "PromExporter.hpp"
+#include "ServiceControl.hpp"
 
-#define SERVICE_NAME  _T("MyRsm")
+namespace {
 
-SERVICE_STATUS        g_ServiceStatus = {0};
-SERVICE_STATUS_HANDLE g_StatusHandle  = NULL;
-HANDLE                g_ServiceStopEvent = INVALID_HANDLE_VALUE;
+// configure() result codes; reported as the service-specific exit code.
+constexpr int kConfigureOk = 0;
+constexpr int kHttpListenFailed = 1;
+constexpr int kHttpBindFailed = 2;
+constexpr int kWsListenFailed = 3;
 
-// Forward declarations
-void WINAPI ServiceMain(DWORD argc, LPTSTR *argv);
-void WINAPI ServiceCtrlHandler(DWORD ctrlCode);
+constexpr DWORD kStartWaitHintMs = 10000;
+constexpr DWORD kStopWaitHintMs = 10000;
 
-// Global pointer to QCoreApplication
-QCoreApplication *app = nullptr;
-quint16 tcpPortArg = 34567;
-quint16 wsPortArg = 34568;
-int pollIntervalMsArg = 250;
-constexpr int kMinPollIntervalMs = 50;
-bool runAsServiceFlag = false;
-bool stop = false;
-prom::Options promOptions;
+AppConfig g_config;
 
-void loadConfigFromCli(QStringList a) {
-    QCommandLineParser parser;
-    QCommandLineOption verboseOption(QStringList() << "v" << "version", "Display versions and exit.");
-    QCommandLineOption consoleOption(QStringList() << "c" << "console", "Run as console application.");
-    QCommandLineOption compatSourceOption("compat-source-label",
-        "Append source=\"http\" to sensor series (matches the post-MQTT connector's extra label).");
+SERVICE_STATUS g_serviceStatus = {};
+SERVICE_STATUS_HANDLE g_statusHandle = nullptr;
+HANDLE g_serviceStopEvent = nullptr;
+DWORD g_checkPoint = 1;
 
-    parser.addOptions({
-            { "httpport", QCoreApplication::translate("main", "The port the http server listens on."),
-              "httpport" },
-            { "wsport", QCoreApplication::translate("wsport", "The port the websocket server listens on."),
-              "wsport" },
-            { "pollms", QCoreApplication::translate("main", "Shared memory poll interval in milliseconds (min 50, default 250)."),
-              "pollms" },
-            { "metric-prefix", "Prometheus metric name prefix (default hwinfo).", "prefix" },
-            { "host-label", "Value of the host label on /metrics (default %COMPUTERNAME%).", "name" },
-            { "freshness-timeout", "Seconds without a fresh HWiNFO sample before /metrics drops sensor series (default 20).",
-              "seconds" },
-            { "include-sensors", "Comma-separated, case-insensitive substrings; only matching sensor names are exported.", "list" },
-            { "exclude-sensors", "Comma-separated, case-insensitive substrings; matching sensor names are not exported.", "list" },
-            { "include-classes", "Comma-separated, case-insensitive substrings; only matching sensor classes are exported.", "list" },
-            { "exclude-classes", "Comma-separated, case-insensitive substrings; matching sensor classes are not exported.", "list" },
-            { "include-apps", "Comma-separated, case-insensitive substrings; only matching sensor apps are exported.", "list" },
-            { "exclude-apps", "Comma-separated, case-insensitive substrings; matching sensor apps are not exported.", "list" },
-            compatSourceOption,
-            verboseOption,
-            consoleOption
-    });
-    parser.addHelpOption();
-    parser.process(a);
-    if (parser.isSet("metric-prefix"))
-        promOptions.metricPrefix = parser.value("metric-prefix");
-    promOptions.hostLabel = parser.isSet("host-label") ? parser.value("host-label")
-                                                       : qEnvironmentVariable("COMPUTERNAME");
-    if (promOptions.hostLabel.isEmpty() && !parser.isSet("host-label"))
-        promOptions.hostLabel = QSysInfo::machineHostName();
-    if (parser.isSet("freshness-timeout")) {
-        bool ok = false;
-        const double t = parser.value("freshness-timeout").toDouble(&ok);
-        if (ok && t > 0 && std::isfinite(t))
-            promOptions.freshnessTimeout = t;
-        else
-            qWarning() << "Ignoring invalid --freshness-timeout" << parser.value("freshness-timeout");
-    }
-    promOptions.includeSensors = prom::parseFilterList(parser.value("include-sensors"));
-    promOptions.excludeSensors = prom::parseFilterList(parser.value("exclude-sensors"));
-    promOptions.includeClasses = prom::parseFilterList(parser.value("include-classes"));
-    promOptions.excludeClasses = prom::parseFilterList(parser.value("exclude-classes"));
-    promOptions.includeApps = prom::parseFilterList(parser.value("include-apps"));
-    promOptions.excludeApps = prom::parseFilterList(parser.value("exclude-apps"));
-    promOptions.compatSourceLabel = parser.isSet(compatSourceOption);
-    if (!parser.value("httpport").isEmpty())
-        tcpPortArg = parser.value("httpport").toUShort();
-    if (!parser.value("wsport").isEmpty())
-        wsPortArg = parser.value("wsport").toUShort();
-    if (!parser.value("pollms").isEmpty()) {
-        int ms = parser.value("pollms").toInt();
-        if (ms < kMinPollIntervalMs) {
-            qWarning() << "--pollms" << ms << "is below the" << kMinPollIntervalMs << "ms minimum; clamping.";
-            ms = kMinPollIntervalMs;
-        }
-        pollIntervalMsArg = ms;
-    }
-    if (parser.isSet(verboseOption)) {
-        QTextStream(stdout) << VERSION << " " << PROJECT_VERSION_NAME << Qt::endl;
-        stop = true;
-        return ;
-    }
-    runAsServiceFlag = GetConsoleWindow() == NULL;
-    if (parser.isSet(consoleOption)) {
-        runAsServiceFlag = false;
-    }
-}
+void WINAPI serviceMain(DWORD argc, LPWSTR* argv);
+DWORD WINAPI serviceCtrlHandler(DWORD control, DWORD eventType, LPVOID eventData, LPVOID context);
 
-static double nowSeconds()
+double nowSeconds()
 {
     return QDateTime::currentMSecsSinceEpoch() / 1000.0;
 }
 
 // /healthz and /readyz: the connector's JSON shape, 200 if exporter_up else 503.
-static QHttpServerResponse healthResponse(const MyRsm* rsm)
+QHttpServerResponse healthResponse(const MyRsm* rsm)
 {
     const double now = nowSeconds();
-    const QList<prom::Row> rows = prom::buildRows(rsm->snapshot(), promOptions);
+    const QList<prom::Row> rows = prom::buildRows(rsm->snapshot(), g_config.prom);
     const prom::Health health = prom::healthFromPoll(rsm->health(), int(rows.size()));
     bool up = false;
-    const QByteArray body = prom::renderHealthJson(health, promOptions, now, &up);
+    const QByteArray body = prom::renderHealthJson(health, g_config.prom, now, &up);
     return QHttpServerResponse(QByteArray(prom::kHealthContentType), body,
                                up ? QHttpServerResponder::StatusCode::Ok
                                   : QHttpServerResponder::StatusCode::ServiceUnavailable);
 }
 
+// Stands up MyRsm and both servers. Shared by console and service mode.
 int configure()
 {
-    auto rsm = new MyRsm(pollIntervalMsArg, promOptions.freshnessTimeout, QCoreApplication::instance());
+    auto rsm = new MyRsm(g_config.pollMs, g_config.prom.freshnessTimeout, QCoreApplication::instance());
     auto server = new QTcpServer(QCoreApplication::instance());
     auto httpServer = new QHttpServer(QCoreApplication::instance());
     auto wsServer = new QWebSocketServer(QStringLiteral("MyRsm WebSocket Server"), QWebSocketServer::NonSecureMode, QCoreApplication::instance());
 
-    if (!server->listen(QHostAddress::Any, tcpPortArg)) {
+    if (!server->listen(g_config.bindAddress, g_config.httpPort)) {
         qCritical() << "Failed to start server:" << server->errorString();
-        return 1;
+        return kHttpListenFailed;
     }
 
     httpServer->route("/", QHttpServerRequest::Method::Get, [rsm](const QHttpServerRequest &request) {
@@ -155,13 +83,13 @@ int configure()
     });
 
     // Prometheus exposition (port of the HWINFOtoPrometheusConnector output).
-    // Query parameters are ignored; filtering comes from the CLI options.
+    // Query parameters are ignored; filtering comes from the configuration.
     httpServer->route("/metrics", QHttpServerRequest::Method::Get, [rsm](const QHttpServerRequest &) {
         const double now = nowSeconds();
-        const QList<prom::Row> rows = prom::buildRows(rsm->snapshot(), promOptions);
+        const QList<prom::Row> rows = prom::buildRows(rsm->snapshot(), g_config.prom);
         const prom::Health health = prom::healthFromPoll(rsm->health(), int(rows.size()));
         return QHttpServerResponse(QByteArray(prom::kContentType),
-                                   prom::render(rows, health, promOptions, now));
+                                   prom::render(rows, health, g_config.prom, now));
     });
     httpServer->route("/healthz", QHttpServerRequest::Method::Get, [rsm](const QHttpServerRequest &) {
         return healthResponse(rsm);
@@ -172,13 +100,13 @@ int configure()
 
     if (!httpServer->bind(server)) {
         qCritical() << "Failed to bind HTTP server to TCP server.";
-        return 1;
+        return kHttpBindFailed;
     }
     qDebug() << "Http server listening on port" << server->serverPort();
 
-    if (!wsServer->listen(QHostAddress::Any, wsPortArg)) {
+    if (!wsServer->listen(g_config.bindAddress, g_config.wsPort)) {
         qCritical() << "Failed to start WebSocket server:" << wsServer->errorString();
-        return 1;
+        return kWsListenFailed;
     }
 
     QObject::connect(wsServer, &QWebSocketServer::newConnection, [wsServer, rsm]() {
@@ -197,7 +125,7 @@ int configure()
             socket->deleteLater();
         });
     });
-    return 0;
+    return kConfigureOk;
 }
 
 //------------------------------------------------------------
@@ -209,7 +137,7 @@ int runAsConsole()
     QCoreApplication app(fake_argc, nullptr);
 
     auto r = configure();
-    if (r != 0)
+    if (r != kConfigureOk)
         return r;
     return app.exec();
 }
@@ -217,83 +145,160 @@ int runAsConsole()
 //------------------------------------------------------------
 // Windows service mode
 //------------------------------------------------------------
+void reportServiceStatus(DWORD state, DWORD win32ExitCode = NO_ERROR, DWORD serviceExitCode = 0,
+                         DWORD waitHintMs = 0)
+{
+    g_serviceStatus.dwServiceType = SERVICE_WIN32_OWN_PROCESS;
+    g_serviceStatus.dwCurrentState = state;
+    g_serviceStatus.dwWin32ExitCode = win32ExitCode;
+    g_serviceStatus.dwServiceSpecificExitCode = serviceExitCode;
+    g_serviceStatus.dwWaitHint = waitHintMs;
+    // No controls while starting; STOP/SHUTDOWN otherwise.
+    g_serviceStatus.dwControlsAccepted =
+        state == SERVICE_START_PENDING ? 0 : (SERVICE_ACCEPT_STOP | SERVICE_ACCEPT_SHUTDOWN);
+    g_serviceStatus.dwCheckPoint =
+        (state == SERVICE_RUNNING || state == SERVICE_STOPPED) ? 0 : g_checkPoint++;
+    if (g_statusHandle)
+        SetServiceStatus(g_statusHandle, &g_serviceStatus);
+}
+
 void runAsService()
 {
-    logger::init();
-    SERVICE_TABLE_ENTRY ServiceTable[] =
-    {
-        { (LPWSTR)SERVICE_NAME, (LPSERVICE_MAIN_FUNCTION)ServiceMain },
-        { NULL, NULL }
+    SERVICE_TABLE_ENTRYW serviceTable[] = {
+        {const_cast<LPWSTR>(service_control::kServiceName), serviceMain},
+        {nullptr, nullptr},
     };
-
-    if (StartServiceCtrlDispatcher(ServiceTable) == FALSE)
-        qDebug() << "Failed to connect to SCM:" << GetLastError();
+    if (!StartServiceCtrlDispatcherW(serviceTable)) {
+        const DWORD e = GetLastError();
+        qCritical() << "Failed to connect to the service control manager:" << e;
+        if (e == ERROR_FAILED_SERVICE_CONTROLLER_CONNECT)
+            qCritical() << "myrsm.exe was started without a console and not by the SCM; use --console"
+                           " or 'myrsm.exe service install'.";
+    }
 }
 
-static inline QString qstringFromTChar(const TCHAR* t)
+void WINAPI serviceMain(DWORD, LPWSTR*)
 {
-#ifdef UNICODE
-    qDebug() << "Converting from wide char";
-    return QString::fromWCharArray(t);
-#else
-    qDebug() << "Converting from local 8 bit";
-    return QString::fromLocal8Bit(t);
-#endif
+    qInfo() << "ServiceMain started.";
+    g_statusHandle = RegisterServiceCtrlHandlerExW(service_control::kServiceName, serviceCtrlHandler, nullptr);
+    if (!g_statusHandle) {
+        qCritical() << "RegisterServiceCtrlHandlerExW failed:" << GetLastError();
+        return;
+    }
+    reportServiceStatus(SERVICE_START_PENDING, NO_ERROR, 0, kStartWaitHintMs);
+
+    g_serviceStopEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    if (!g_serviceStopEvent) {
+        const DWORD e = GetLastError();
+        qCritical() << "CreateEventW failed:" << e;
+        reportServiceStatus(SERVICE_STOPPED, e);
+        return;
+    }
+
+    int result = kConfigureOk;
+    {
+        int fake_argc = 0;
+        QCoreApplication app(fake_argc, nullptr);
+        result = configure();
+        if (result == kConfigureOk) {
+            std::thread waiter([&app]() {
+                WaitForSingleObject(g_serviceStopEvent, INFINITE);
+                QMetaObject::invokeMethod(&app, "quit", Qt::QueuedConnection);
+            });
+            // RUNNING only once the servers are actually listening.
+            reportServiceStatus(SERVICE_RUNNING);
+            qInfo() << "Service running.";
+            app.exec();
+            SetEvent(g_serviceStopEvent); // in case exec() returned on its own
+            waiter.join();
+            qInfo() << "Service stopping.";
+        } else {
+            qCritical() << "Service failed to start, exit code" << result;
+        }
+        // app and everything parented to it are destroyed here, before we
+        // tell the SCM we're stopped.
+    }
+    CloseHandle(g_serviceStopEvent);
+    g_serviceStopEvent = nullptr;
+
+    if (result == kConfigureOk)
+        reportServiceStatus(SERVICE_STOPPED);
+    else
+        reportServiceStatus(SERVICE_STOPPED, ERROR_SERVICE_SPECIFIC_ERROR, DWORD(result));
 }
+
+DWORD WINAPI serviceCtrlHandler(DWORD control, DWORD, LPVOID, LPVOID)
+{
+    switch (control) {
+    case SERVICE_CONTROL_STOP:
+    case SERVICE_CONTROL_SHUTDOWN:
+        reportServiceStatus(SERVICE_STOP_PENDING, NO_ERROR, 0, kStopWaitHintMs);
+        if (g_serviceStopEvent)
+            SetEvent(g_serviceStopEvent);
+        return NO_ERROR;
+    case SERVICE_CONTROL_INTERROGATE:
+        return NO_ERROR;
+    default:
+        return ERROR_CALL_NOT_IMPLEMENTED;
+    }
+}
+
+} // namespace
 
 int main(int argc, char **argv)
 {
     qSetMessagePattern(u"%{category}:%{type}:%{time yyyyMMdd h:mm:ss.zzz "
                     "t}:(%{file}:%{line}):%{function}:%{message}"_s);
+    // Unicode command line (argv is in the ANSI code page).
     QStringList arguments;
-    for (int i = 0; i < argc; ++i) {
-        arguments << argv[i];
+    int wargc = 0;
+    if (LPWSTR* wargv = CommandLineToArgvW(GetCommandLineW(), &wargc)) {
+        for (int i = 0; i < wargc; ++i)
+            arguments << QString::fromWCharArray(wargv[i]);
+        LocalFree(wargv);
+    } else {
+        for (int i = 0; i < argc; ++i)
+            arguments << QString::fromLocal8Bit(argv[i]);
     }
-    loadConfigFromCli(arguments);
-    if (stop)
+
+    // myrsm.exe service <install|uninstall|start|stop|status>
+    if (arguments.size() >= 2 && arguments.at(1) == u"service")
+        return service_control::run(arguments.mid(2));
+
+    QCommandLineParser parser;
+    QCommandLineOption versionOption(QStringList() << "v" << "version", "Display versions and exit.");
+    QCommandLineOption consoleOption(QStringList() << "c" << "console", "Run as console application.");
+    addConfigOptions(parser);
+    parser.addOption(versionOption);
+    parser.addOption(consoleOption);
+    parser.addHelpOption();
+    parser.process(arguments);
+
+    if (parser.isSet(versionOption)) {
+        QTextStream(stdout) << VERSION << " " << PROJECT_VERSION_NAME << Qt::endl;
         return 0;
-    if (runAsServiceFlag == false) {
+    }
+
+    const bool runAsServiceFlag = GetConsoleWindow() == nullptr && !parser.isSet(consoleOption);
+    // Service mode logs to %ProgramData%\MyRsm\logs; initialise the logger
+    // once, before anything is logged (config warnings included).
+    if (runAsServiceFlag)
+        logger::init();
+
+    QStringList warnings;
+    g_config = resolveConfig(parser, &warnings);
+    for (const QString& w : warnings)
+        qWarning().noquote() << w;
+    qInfo().noquote() << "MyRsm" << VERSION << PROJECT_VERSION_NAME << describeConfig(g_config);
+
+    int rc = 0;
+    if (!runAsServiceFlag) {
         qDebug() << "Starting console application...";
-        return runAsConsole();
+        rc = runAsConsole();
+    } else {
+        qDebug() << "Starting service...";
+        runAsService();
+        logger::uninit();
     }
-    qDebug() << "Starting service...";
-    runAsService();
-    return 0;
-}
-
-void WINAPI ServiceMain(DWORD argc, LPTSTR *argv)
-{
-    logger::init();
-    qDebug() << "ServiceMain started.";
-    int fake_argc = 0;
-    QCoreApplication app(fake_argc, nullptr);
-    g_StatusHandle = RegisterServiceCtrlHandler(SERVICE_NAME, ServiceCtrlHandler);
-
-    g_ServiceStatus.dwServiceType = SERVICE_WIN32_OWN_PROCESS;
-    g_ServiceStatus.dwCurrentState = SERVICE_START_PENDING;
-    SetServiceStatus(g_StatusHandle, &g_ServiceStatus);
-
-    g_ServiceStopEvent = CreateEvent(NULL, TRUE, FALSE, NULL);
-
-    g_ServiceStatus.dwControlsAccepted = SERVICE_ACCEPT_STOP;
-    g_ServiceStatus.dwCurrentState = SERVICE_RUNNING;
-    SetServiceStatus(g_StatusHandle, &g_ServiceStatus);
-
-    auto r = configure();
-    if (r == 0) {
-            std::thread([&]() {
-            WaitForSingleObject(g_ServiceStopEvent, INFINITE);
-            QMetaObject::invokeMethod(&app, "quit", Qt::QueuedConnection);
-        }).detach();
-        app.exec();
-    }
-    g_ServiceStatus.dwCurrentState = SERVICE_STOPPED;
-    SetServiceStatus(g_StatusHandle, &g_ServiceStatus);
-    logger::uninit();
-}
-
-void WINAPI ServiceCtrlHandler(DWORD ctrlCode)
-{
-    if (ctrlCode == SERVICE_CONTROL_STOP)
-        SetEvent(g_ServiceStopEvent);
+    return rc;
 }
