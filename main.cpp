@@ -78,7 +78,7 @@ void loadConfigFromCli(QStringList a) {
 
 int configure()
 {
-    auto rsm = new MyRsm(pollIntervalMsArg, QCoreApplication::instance());
+    auto rsm = new MyRsm(pollIntervalMsArg, 20.0, QCoreApplication::instance());
     auto server = new QTcpServer(QCoreApplication::instance());
     auto httpServer = new QHttpServer(QCoreApplication::instance());
     auto wsServer = new QWebSocketServer(QStringLiteral("MyRsm WebSocket Server"), QWebSocketServer::NonSecureMode, QCoreApplication::instance());
