@@ -235,28 +235,36 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          $vs = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -property installationPath
-          $redist = Get-ChildItem "$vs\VC\Redist\MSVC" -Directory |
-                    Where-Object { $_.Name -match '^\d+\.\d+\.\d+$' } |
-                    Sort-Object { [version]$_.Name } -Descending |
-                    ForEach-Object { Join-Path $_.FullName 'vc_redist.x64.exe' } |
-                    Where-Object { Test-Path $_ } | Select-Object -First 1
-          if (-not $redist) { throw "vc_redist.x64.exe not found under $vs\VC\Redist\MSVC" }
-          $vi = (Get-Item $redist).VersionInfo
-          Write-Host "Bundling $redist ($($vi.FileVersion))"
+          # Errors become a workflow annotation (readable without the raw log).
+          try {
+            $vs = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -property installationPath
+            $redist = Get-ChildItem "$vs\VC\Redist\MSVC" -Directory |
+                      Where-Object { $_.Name -match '^\d+\.\d+\.\d+$' } |
+                      Sort-Object { [version]$_.Name } -Descending |
+                      ForEach-Object { Join-Path $_.FullName 'vc_redist.x64.exe' } |
+                      Where-Object { Test-Path $_ } | Select-Object -First 1
+            if (-not $redist) { throw "vc_redist.x64.exe not found under $vs\VC\Redist\MSVC" }
+            $vi = (Get-Item $redist).VersionInfo
+            Write-Host "Bundling $redist ($($vi.FileVersion))"
 
-          $iscc = (Get-Command iscc.exe -ErrorAction SilentlyContinue).Source
-          if (-not $iscc) { $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" }
-          if (-not (Test-Path $iscc)) {
-            choco install innosetup -y --no-progress
-            $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+            $iscc = (Get-Command iscc.exe -ErrorAction SilentlyContinue).Source
+            if (-not $iscc) { $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" }
+            if (-not (Test-Path $iscc)) {
+              choco install innosetup -y --no-progress
+              $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+            }
+            $isccOut = & $iscc "/DAppVersion=$env:APP_VERSION" `
+                    "/DSourceDir=${{ github.workspace }}\deploy" `
+                    "/DIconFile=${{ github.workspace }}\build\icon.ico" `
+                    "/DVCRedist=$redist" "/DVCRedistMinor=$($vi.FileMinorPart)" "/DVCRedistBld=$($vi.FileBuildPart)" `
+                    "/O${{ github.workspace }}\installer-out" installer\myrsm.iss 2>&1 | Out-String
+              Write-Host $isccOut
+            if ($LASTEXITCODE -ne 0) { throw "ISCC failed ($LASTEXITCODE):`n$isccOut" }
+          } catch {
+            $msg = ($_ | Out-String).Trim() -split "`r?`n" | Select-Object -Last 25
+            Write-Host "::error title=Build installer::$($msg -join '%0A')"
+            exit 1
           }
-          & $iscc "/DAppVersion=$env:APP_VERSION" `
-                  "/DSourceDir=${{ github.workspace }}\deploy" `
-                  "/DIconFile=${{ github.workspace }}\build\icon.ico" `
-                  "/DVCRedist=$redist" "/DVCRedistMinor=$($vi.FileMinorPart)" "/DVCRedistBld=$($vi.FileBuildPart)" `
-                  "/O${{ github.workspace }}\installer-out" installer\myrsm.iss
-          if ($LASTEXITCODE -ne 0) { throw "ISCC failed ($LASTEXITCODE)" }
 
       # Silent install -> checks -> ini edit + restart -> upgrade -> uninstall.
       - name: Installer test (silent)
