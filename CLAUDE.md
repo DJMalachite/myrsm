@@ -49,35 +49,53 @@ assumption for development — pushing a branch is the expected way to get a bui
 ## Running
 
 ```
-myrsm.exe [--console] [--httpport <port>] [--wsport <port>] [--pollms <ms>] [--version]
-          [--metric-prefix <p>] [--host-label <name>] [--freshness-timeout <s>]
+myrsm.exe [--console] [--config <ini>] [--httpport <port>] [--wsport <port>] [--pollms <ms>]
+          [--bind-address <ip>] [--metric-prefix <p>] [--host-label <name>] [--freshness-timeout <s>]
           [--include-sensors|--exclude-sensors|--include-classes|--exclude-classes|--include-apps|--exclude-apps <csv>]
-          [--compat-source-label]
+          [--compat-source-label] [--version]
+myrsm.exe service <install|uninstall|start|stop|status>
 ```
+
+- Config precedence: defaults < `%ProgramData%\MyRsm\myrsm.ini` (`[myrsm]` section, or `--config`)
+  < command line — see [Config.hpp](Config.hpp). The service binPath has no arguments, so the
+  installed service is configured only through the ini (edit + `Restart-Service MyRsm`). Console
+  mode reads the ini too.
 
 - The Prometheus options only affect `/metrics` and `/healthz`/`/readyz` (defaults: prefix
   `hwinfo`, host `%COMPUTERNAME%`, freshness `20` s, no filters, no `source` label). See
   [README.md](README.md) for semantics; they mirror the Python connector's env vars.
 
-- Default ports: HTTP `34567`... but note the *actual* HTTP route is bound via `QHttpServer::bind`
-  onto the raw `QTcpServer`, and `test.http` connects on `34569` — check `tcpPortArg`/`wsPortArg`
-  defaults in [main.cpp](main.cpp) against whatever you're testing against, they're easy to
-  misremember.
-- `--pollms` sets the shared-memory poll interval (default `250`, clamped to a `50`ms floor in
-  `loadConfigFromCli`). This is the effective freshness bound for both the HTTP endpoint and the
+- Default ports: HTTP `34567`, WebSocket `34568` (`AppConfig` in [Config.hpp](Config.hpp)); the
+  HTTP routes are bound via `QHttpServer::bind` onto the raw `QTcpServer`. `test.http` connects on
+  `34569` — easy to misremember, check against whatever you're testing.
+- `--pollms` / `poll_ms` sets the shared-memory poll interval (default `250`, clamped to a `50`ms
+  floor in Config.cpp). This is the effective freshness bound for both the HTTP endpoint and the
   WebSocket push — a scraper hitting `/` faster than this just re-reads the same cached tick.
-- With no console attached and no `--console` flag, the app calls `StartServiceCtrlDispatcher` and
-  expects to be launched by the Windows SCM (see `control.qs`, which registers/starts/stops the
-  `MyRsm` service via `sc.exe` during install/uninstall).
+- With no console attached and no `--console` flag, the app calls `StartServiceCtrlDispatcherW` and
+  expects to be launched by the Windows SCM. The service is registered by
+  `myrsm.exe service install` ([ServiceControl.cpp](ServiceControl.cpp), SCM API: quoted binPath,
+  LocalSystem, delayed auto-start, restart-on-failure), which the installer calls. Exit codes 0 ok,
+  1 failed, 2 usage, 3 not elevated, 4 not installed.
 - `--version` prints `VERSION` / `PROJECT_VERSION_NAME` and exits without starting any server.
 
 ## Architecture
 
-- **[main.cpp](main.cpp)** — entry point, CLI parsing, HTTP/WebSocket server wiring, and the Windows
-  Service scaffolding (`ServiceMain`, `ServiceCtrlHandler`, SCM status reporting). Both the console
-  path (`runAsConsole`) and the service path (`ServiceMain`) independently construct a
-  `QCoreApplication` and call the shared `configure()` to stand up the `MyRsm` instance and both
-  servers — keep them in sync if you change server setup.
+- **[main.cpp](main.cpp)** — entry point (`service` subcommand dispatch, CLI parsing via
+  `addConfigOptions`/`resolveConfig`), HTTP/WebSocket server wiring, and the Windows Service
+  scaffolding (`serviceMain`, `serviceCtrlHandler`, `reportServiceStatus`). Both the console path
+  (`runAsConsole`) and the service path (`serviceMain`) construct a `QCoreApplication` and call the
+  shared `configure()` — keep them in sync if you change server setup. Service lifecycle:
+  START_PENDING → `configure()` → RUNNING only once the servers listen; a `configure()` failure
+  stops with `ERROR_SERVICE_SPECIFIC_ERROR` and its code (1 HTTP listen, 2 HTTP bind, 3 WS listen);
+  STOP/SHUTDOWN report STOP_PENDING, and STOPPED is reported only after the app and its objects
+  are destroyed. The logger is initialised once, in `main()`, before config warnings are logged.
+- **[Config.hpp](Config.hpp) / [Config.cpp](Config.cpp)** — `AppConfig`, ini + CLI resolution,
+  validation (invalid/unknown values become logged warnings, never fatal). Windows-free, tested by
+  `tst_config`. QSettings' INI parser turns comma-separated values into a `QStringList`; `iniString()`
+  joins them back — keep that if you touch list-valued keys.
+- **[ServiceControl.hpp](ServiceControl.hpp) / [ServiceControl.cpp](ServiceControl.cpp)** —
+  `myrsm.exe service ...` over the SCM API. `install` on an existing service stops it and repoints
+  it (this is how an old IFW / manual install gets migrated). CI exercises all of it on the runner.
 - **[MyRsm.hpp](MyRsm.hpp) / [MyRsm.cpp](MyRsm.cpp)** — the core: attaches to HWiNFO's named shared
   memory segment (`HWiNFO_SENSORS_MAP_FILE_NAME2`) and stays attached (no per-tick attach/detach —
   that was measurable overhead once polling moved to sub-second intervals). Polls on a `QTimer` at
@@ -115,9 +133,10 @@ myrsm.exe [--console] [--httpport <port>] [--wsport <port>] [--pollms <ms>] [--v
   as a third-party interface header, not application code.
 - **[logger.hpp](logger.hpp) / [logger.cpp](logger.cpp)** — singleton (`logger::init()` /
   `logger::uninit()`) installed as a Qt message handler (`qInstallMessageHandler`). Writes timestamped
-  log files to `C:/ProgramData/myrsm/` (or `C:/ProgramData/myrsm_<BRANCH>/` for non-`main` branches),
-  rotating to keep only the last 7 files, rolling over daily. Only wired up in service mode
-  (`runAsService()` calls `logger::init()`); console mode relies on Qt's default stderr logging via
+  log files to `%ProgramData%/MyRsm/logs/` for release builds (`main`, or `MYRSM_RELEASE=1` → the
+  `MYRSM_RELEASE_BUILD` define, set by CI for main and `v*` tags) and `%ProgramData%/MyRsm/logs-<BRANCH>/`
+  otherwise, rotating to keep only the last 7 files, rolling over daily. Only wired up in service mode
+  (`main()` calls `logger::init()` once); console mode relies on Qt's default stderr logging via
   the `qSetMessagePattern` set in `main()`. Set env var `STDERR_LOG=1` to also mirror log output to
   stderr when the file logger is active.
 - **HTTP/WebSocket surface** — `/` on both transports, plus HTTP-only `/metrics`, `/healthz`
@@ -128,13 +147,16 @@ myrsm.exe [--console] [--httpport <port>] [--wsport <port>] [--pollms <ms>] [--v
 - **[myrsm.rc.in](myrsm.rc.in) / CMake icon generation** — Windows version-info resource, templated
   by CMake (`@VERSION@`, `@VERSION_JOB@`, `@COMMENT@`, etc.) and paired with an `.ico` generated from
   `logo-rsm.png` via ImageMagick at build time.
-- **[control.qs](control.qs)** — Qt Installer Framework control script run during
-  install/uninstall of the packaged installer. Registers/deregisters the `MyRsm` Windows service via
-  `sc.exe` and copies/removes the per-user uninstall registry key to `HKEY_LOCAL_MACHINE` when
-  installed for all users. This only runs in the context of the IFW-built installer, not during
-  normal development.
+- **[installer/myrsm.iss](installer/myrsm.iss)** — Inno Setup 6 installer (replaced the CPack/IFW
+  one). Per-machine, admin, stable `AppId`. Settings page → merged into `myrsm.ini`; stops the service
+  before copying (upgrade), then `service install` / firewall rule / `service start` / polls
+  `/healthz`. Bundles the runner's `vc_redist.x64.exe` (windeployqt doesn't ship the VC runtime).
+  Silent parameters `/HTTPPORT= /WSPORT= /POLLMS= /HOSTLABEL= /PREFIX= /COMPATSOURCE= /FIREWALL=
+  /FWSCOPE=`; uninstaller `/PURGEDATA`. Built and tested (silent install / ini edit / upgrade /
+  uninstall) in CI; the manual checklist is [docs/installer-test.md](docs/installer-test.md).
 
 ## Licensing
 
-GPLv3 (see [LICENSE](LICENSE)). `myrsm.rc.in` marks the binary itself "Private use only" in its
-version resource — be aware of this apparent inconsistency if touching packaging/licensing metadata.
+GPLv3 (see [LICENSE](LICENSE)), as in the original upstream repo; the owner confirmed it stays GPLv3.
+The version resource in `myrsm.rc.in` says "Licensed under the GNU GPL v3" (it used to say "Private
+use only"), and the installer shows the GPLv3 `LICENSE`. Keep all three consistent.

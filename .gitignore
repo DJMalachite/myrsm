@@ -56,3 +56,7 @@ compile_commands.json
 # Python
 __pycache__/
 *.pyc
+
+# Installer output
+installer-out/
+installer/Output/

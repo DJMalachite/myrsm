@@ -23,31 +23,98 @@ after:  HWiNFO → MyRsm (JSON :34567 /  +  Prometheus :34567/metrics)    → Pr
 HWiNFO must have **Shared Memory Support** enabled (Settings). On the free version it switches off
 every 12 hours.
 
+## Install
+
+Run `MyRsm-Setup-<version>.exe` (from the CI artifact or a GitHub Release) as an administrator.
+It installs to `C:\Program Files\MyRsm` and registers the `MyRsm` service: Automatic (Delayed
+Start), LocalSystem, restarted by Windows if it fails. It writes the settings page values to
+`%ProgramData%\MyRsm\myrsm.ini`, optionally adds a Windows Firewall rule for the HTTP port, and
+checks `/healthz` before it finishes. Upgrades install in place and keep the ini. An existing
+`MyRsm` service from an older install, such as the per-user IFW installer or a manual copy, is
+stopped and repointed, and its `--host-label`/`--httpport`/... arguments prefill the settings page.
+
+Unattended:
+
+```
+MyRsm-Setup-<version>.exe /VERYSILENT /SUPPRESSMSGBOXES /HTTPPORT=34567 /HOSTLABEL=<name> /FWSCOPE=<prometheus-ip>
+```
+
+Further parameters are `/WSPORT=`, `/POLLMS=`, `/PREFIX=`, `/COMPATSOURCE=0|1` and `/FIREWALL=0|1`.
+Uninstalling removes the service and the firewall rule, and asks before deleting
+`%ProgramData%\MyRsm` (config and logs). A silent uninstall keeps it unless you pass `/PURGEDATA`.
+
+MyRsm runs as **LocalSystem** because it needs to open HWiNFO's `Global\` shared memory and mutex
+reliably, whoever is logged in.
+
+Installer checklist: [docs/installer-test.md](docs/installer-test.md).
+
+## Configuration
+
+Settings come from, in increasing priority: built-in defaults, then `%ProgramData%\MyRsm\myrsm.ini`
+(or `--config <file>`), then the command line. The service is started with no arguments, so you
+change its settings by editing the ini and running `Restart-Service MyRsm`.
+
+```ini
+[myrsm]
+http_port=34567
+ws_port=34568
+poll_ms=250
+bind_address=            ; empty/"any" = all interfaces, or an IP address
+metric_prefix=hwinfo
+host_label=              ; empty = %COMPUTERNAME%
+freshness_timeout=20
+compat_source_label=false
+include_sensors=         ; comma-separated, case-insensitive substrings
+exclude_sensors=
+include_classes=
+exclude_classes=
+include_apps=
+exclude_apps=
+```
+
+Invalid or unknown keys are logged and ignored. The effective configuration is logged at startup.
+
+| Option | ini key | Default | Notes |
+|---|---|---|---|
+| `--httpport` | `http_port` | `34567` | HTTP port for `/`, `/metrics`, `/healthz`, `/readyz` |
+| `--wsport` | `ws_port` | `34568` | WebSocket port |
+| `--pollms` | `poll_ms` | `250` | shared-memory poll interval, minimum 50 ms |
+| `--bind-address` | `bind_address` | all interfaces | address both servers listen on |
+| `--metric-prefix` | `metric_prefix` | `hwinfo` | passed through the connector's `sanitize_name()` |
+| `--host-label` | `host_label` | `%COMPUTERNAME%` | value of the `host` label; set it to the connector's `EXPORTER_HOST` when migrating |
+| `--freshness-timeout` | `freshness_timeout` | `20` | seconds without a fresh HWiNFO sample before sensor series are withheld |
+| `--include-*` / `--exclude-*` | `include_*` / `exclude_*` | empty | comma-separated, case-insensitive substrings matched against `sensor_name` / `sensor_class` / `sensor_app` (connector `INCLUDE_SENSORS` etc.) |
+| `--compat-source-label` | `compat_source_label` | off | adds `source="http"` to every sensor series, matching the post-MQTT connector |
+| `--config` | | `%ProgramData%\MyRsm\myrsm.ini` | ini file to read |
+| `--console` | | | run in the console instead of as a Windows service |
+
 ## Running
 
 ```
-myrsm.exe [--console] [--httpport <port>] [--wsport <port>] [--pollms <ms>] [--version]
-          [--metric-prefix <prefix>] [--host-label <name>] [--freshness-timeout <seconds>]
-          [--include-sensors <list>] [--exclude-sensors <list>]
-          [--include-classes <list>] [--exclude-classes <list>]
-          [--include-apps <list>] [--exclude-apps <list>]
-          [--compat-source-label]
+myrsm.exe [--console] [options above] [--version]
+myrsm.exe service <install|uninstall|start|stop|status>
 ```
 
-| Option | Default | Notes |
-|---|---|---|
-| `--httpport` | `34567` | HTTP port for `/`, `/metrics`, `/healthz`, `/readyz` |
-| `--wsport` | `34568` | WebSocket port |
-| `--pollms` | `250` | shared-memory poll interval, minimum 50 ms |
-| `--metric-prefix` | `hwinfo` | passed through the connector's `sanitize_name()` |
-| `--host-label` | `%COMPUTERNAME%` | value of the `host` label; set it to the connector's `EXPORTER_HOST` when migrating |
-| `--freshness-timeout` | `20` | seconds without a fresh HWiNFO sample before sensor series are withheld |
-| `--include-*` / `--exclude-*` | empty | comma-separated, case-insensitive substrings matched against `sensor_name` / `sensor_class` / `sensor_app` (connector `INCLUDE_SENSORS` etc.) |
-| `--compat-source-label` | off | adds `source="http"` to every sensor series, matching the post-MQTT connector |
-| `--console` | | run in the console instead of as a Windows service |
-
 With no console attached and no `--console`, MyRsm expects to be started by the Windows Service
-Control Manager as the `MyRsm` service.
+Control Manager as the `MyRsm` service. In console mode it also reads the ini.
+
+`myrsm.exe service ...` manages the service through the SCM API:
+
+- `install` creates the service for this `myrsm.exe`. If it already exists, `install` stops it and
+  updates it in place. The binPath is quoted with no arguments; the service runs Automatic
+  (Delayed Start) as LocalSystem, restarts after 5 s (three times, count reset after a day), and has
+  a description.
+- `uninstall` stops and removes the service.
+- `start` and `stop` wait for RUNNING / STOPPED, for up to 30 s.
+- `status` shows the state, start type, account, binary and last exit code.
+
+`install`, `uninstall`, `start` and `stop` need an elevated prompt. Exit codes: 0 ok, 1 failed,
+2 usage, 3 not elevated, 4 not installed. Stopping or uninstalling something that isn't running or
+installed counts as success.
+
+Service logs are in `%ProgramData%\MyRsm\logs\` (`logs-<branch>\` for non-release builds), 7 files
+kept. When the service fails to start, it reports a service-specific exit code: `1` HTTP port in use,
+`2` HTTP bind failed, `3` WebSocket port in use.
 
 `%COMPUTERNAME%` is the upper-case NetBIOS name. The connector defaulted to Python's
 `socket.gethostname()`, whose case can differ, so set `--host-label` explicitly when migrating.
@@ -127,11 +194,15 @@ ctest --test-dir build -C Release --output-on-failure
 HttpServer, WebSockets or ImageMagick. `-DMYRSM_BUILD_TESTS=OFF` skips the tests.
 
 CI ([.github/workflows/build.yml](.github/workflows/build.yml)) builds on `windows-latest`, runs the
-unit tests and the parity test, smoke-tests the HTTP routes and uploads a portable folder as the
-`myrsm-win64-<run>` artifact.
+unit tests and the parity test, smoke-tests the HTTP routes, tests the service lifecycle against the
+real SCM, builds the Inno Setup installer ([installer/myrsm.iss](installer/myrsm.iss), bundling the
+matching `vc_redist.x64.exe`), and runs a silent install, upgrade and uninstall. It uploads the
+portable folder (`myrsm-win64-<run>`) and the installer (`MyRsm-Setup-<run>`), and on `v*` tags
+attaches the installer to the GitHub Release.
 
 ## Tests
 
+- `tst_config` (Qt Test): ini parsing, validation and precedence (CLI > ini > defaults).
 - `tst_promexporter` (Qt Test): unit normalisation, `sanitize_name`, mojibake repair, `safe_float`,
   occurrence numbering, stale/never-succeeded output, label escaping, and a check that the `/` JSON
   is byte-identical to the pre-refactor implementation.

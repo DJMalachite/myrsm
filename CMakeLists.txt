@@ -1,7 +1,5 @@
 cmake_minimum_required(VERSION 3.16)
 
-include(CPackComponent)
-
 function(split_ver VARNAME VALUE)
   set(MAJOR 0)
   set(MINOR 0)
@@ -55,6 +53,10 @@ endif()
 add_definitions(-DVERSION=\"${VERSION}\")
 add_definitions(-DBRANCH=\"${BRANCH}\")
 add_definitions(-DPROJECT_VERSION_NAME=\"${PROJECT_VERSION_NAME}\")
+# CI sets MYRSM_RELEASE=1 for main and v* tags: logs go to %ProgramData%\MyRsm\logs.
+if("$ENV{MYRSM_RELEASE}" STREQUAL "1")
+  add_definitions(-DMYRSM_RELEASE_BUILD)
+endif()
 message("Building ${VERSION} ${PROJECT_VERSION_NAME}")
 set(COMMENT "${PROJECT_VERSION_NAME}")
 
@@ -73,8 +75,6 @@ add_custom_command(
 
 set_source_files_properties(${RC_FILE} PROPERTIES OBJECT_DEPENDS ${ICONICO})
 
-string(REPLACE "-" "_" CPACK_TAG "${PROJECT_NAME}_$ENV{CI_COMMIT_REF_SLUG}")
-
 configure_file(myrsm.rc.in myrsm.rc @ONLY)
 
 option(MYRSM_BUILD_APP "Build the myrsm executable (needs Qt HttpServer + WebSockets)" ON)
@@ -85,18 +85,20 @@ if(MSVC)
   add_compile_options(/utf-8)
 endif()
 
-find_package(Qt6 REQUIRED COMPONENTS Core)
+find_package(Qt6 REQUIRED COMPONENTS Core Network)
 
-# Shared-memory reader + Windows-free Prometheus exporter, shared by the app,
-# the unit tests and the fixture renderer.
+# Shared-memory reader, Windows-free Prometheus exporter and config loading,
+# shared by the app, the unit tests and the fixture renderer.
 add_library(myrsm_core STATIC
   RsmTypes.hpp
   MyRsm.hpp
   MyRsm.cpp
   PromExporter.hpp
-  PromExporter.cpp)
+  PromExporter.cpp
+  Config.hpp
+  Config.cpp)
 target_include_directories(myrsm_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
-target_link_libraries(myrsm_core PUBLIC Qt6::Core)
+target_link_libraries(myrsm_core PUBLIC Qt6::Core Qt6::Network)
 
 if(MYRSM_BUILD_TESTS)
   enable_testing()
@@ -107,6 +109,12 @@ if(MYRSM_BUILD_TESTS)
   add_test(NAME tst_promexporter COMMAND tst_promexporter)
   # Find the Qt DLLs when run from the build tree.
   set_tests_properties(tst_promexporter PROPERTIES
+    ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:Qt6::Core>")
+
+  qt_add_executable(tst_config tests/tst_config.cpp)
+  target_link_libraries(tst_config PRIVATE myrsm_core Qt6::Test)
+  add_test(NAME tst_config COMMAND tst_config)
+  set_tests_properties(tst_config PROPERTIES
     ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:Qt6::Core>")
 
   # Renders a MyRSM "/" JSON fixture through prom::render (driven by
@@ -123,18 +131,21 @@ if(NOT MYRSM_BUILD_APP)
 endif()
 
 find_package(Qt6 REQUIRED COMPONENTS HttpServer Network WebSockets)
+include(GNUInstallDirs)
 
 qt_add_executable(myrsm
   main.cpp
+  ServiceControl.hpp
+  ServiceControl.cpp
   logger.hpp
   logger.cpp
   ${RC_FILE})
 
-target_link_libraries(myrsm PRIVATE myrsm_core Qt6::Core Qt6::HttpServer Qt6::Network Qt6::WebSockets)
+target_link_libraries(myrsm PRIVATE myrsm_core Qt6::Core Qt6::HttpServer Qt6::Network Qt6::WebSockets
+  advapi32 shell32)
 
-set(PROJECT_INSTALLER_MAIN_COMP ${CPACK_TAG})
-set(PROJECT_INSTALLER_LIB_COMP ${CPACK_TAG}_libs)
-
+# Portable layout used by the installer (installer/myrsm.iss) and the CI
+# artifact: bin/myrsm.exe + Qt DLLs, plugins/, translations/.
 qt_generate_deploy_app_script(
   TARGET
   ${PROJECT_NAME}
@@ -144,56 +155,24 @@ qt_generate_deploy_app_script(
 )
 install(
   TARGETS ${PROJECT_NAME}
-  COMPONENT ${PROJECT_INSTALLER_MAIN_COMP}
   RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
-          COMPONENT ${PROJECT_INSTALLER_MAIN_COMP}
-  LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
-          COMPONENT ${PROJECT_INSTALLER_MAIN_COMP})
-install(SCRIPT ${deploy_script} COMPONENT ${PROJECT_INSTALLER_LIB_COMP})
+  LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR})
+install(SCRIPT ${deploy_script})
 
 function(copy_to VAR DEST)
   if(EXISTS ${VAR})
     message(NOTICE "> will install ${VAR} to ${DEST}")
     install(
       FILES ${VAR}
-      DESTINATION ${DEST}
-      COMPONENT ${PROJECT_INSTALLER_MAIN_COMP})
+      DESTINATION ${DEST})
   else()
     message(NOTICE "> ${VAR} not found")
   endif()
 endfunction()
 
+# MinGW runtime DLLs, only present for MinGW Qt builds.
 copy_to(${Qt6_DIR}/../../../bin/libc++.dll ${CMAKE_INSTALL_BINDIR})
 copy_to(${Qt6_DIR}/../../../bin/libunwind.dll ${CMAKE_INSTALL_BINDIR})
 copy_to(${Qt6_DIR}/../../../bin/libstdc++-6.dll ${CMAKE_INSTALL_BINDIR})
 copy_to(${Qt6_DIR}/../../../bin/libgcc_s_seh-1.dll ${CMAKE_INSTALL_BINDIR})
 copy_to(${Qt6_DIR}/../../../bin/libwinpthread-1.dll ${CMAKE_INSTALL_BINDIR})
-
-set(CPACK_GENERATOR "IFW")
-set(CPACK_VERBATIM_VARIABLES YES)
-
-set(CPACK_IFW_PACKAGE_NAME ${CPACK_TAG})
-set(CPACK_IFW_PACKAGE_TITLE ${CPACK_TAG})
-set(CPACK_IFW_PACKAGE_PUBLISHER "qdel")
-set(CPACK_IFW_PACKAGE_ICON "${CMAKE_CURRENT_BINARY_DIR}/icon.ico")
-
-set(CPACK_IFW_PACKAGE_CONTROL_SCRIPT
-    "${CMAKE_CURRENT_SOURCE_DIR}/control.qs")
-
-cpack_add_component(
-  ${PROJECT_INSTALLER_LIB_COMP}
-  DISPLAY_NAME "MyRsm app libraries"
-  REQUIRED
-  DESCRIPTION "MyRsm app libraries")
-cpack_add_component(
-  ${PROJECT_INSTALLER_MAIN_COMP}
-  DISPLAY_NAME "MyRsm App"
-  REQUIRED
-  DESCRIPTION "MyRsm application!"
-  DEPENDS ${PROJECT_INSTALLER_LIB_COMP})
-
-include(CPack)
-include(CPackIFW)
-
-cpack_ifw_configure_component(
-  ${PROJECT_INSTALLER_MAIN_COMP})
