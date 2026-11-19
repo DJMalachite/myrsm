@@ -84,12 +84,15 @@ myrsm.exe [--console] [--httpport <port>] [--wsport <port>] [--pollms <ms>] [--v
   the interval passed into the constructor (`--pollms`, default 250ms) and parses the two
   variable-length array sections (sensors, then readings) using offsets/strides read from the shared
   memory header itself (`dwOffsetOfSensorSection`, `dwSizeOfSensorElement`, etc.) rather than fixed
-  struct layouts. Each poll acquires the `HWiNFO_SENSORS_SM2_MUTEX` named mutex (opened once at
-  construction, held via `m_hwinfoMutex`) with a short (50ms) timeout before touching the mapped
-  memory — HWiNFO documents this mutex as required to avoid torn reads while it's writing; if the
-  wait times out, that tick is skipped rather than risking corrupt data. It also checks
-  `dwSignature` for HWiNFO's documented `DEAD` marker and holds onto the last-known-good readings
-  if HWiNFO has gone away, instead of parsing garbage. `poll()` re-reads the sensor list only when
+  struct layouts. Each poll acquires the `HWiNFO_SENSORS_SM2_MUTEX` named mutex with a short
+  (50ms) timeout before touching the mapped memory — HWiNFO documents this mutex as required to
+  avoid torn reads while it's writing; if the wait times out, that tick is skipped rather than
+  risking corrupt data. The mutex is opened with `OpenMutexA` for each read and closed right after
+  (`HwinfoMutexLock`); never create it and never hold a handle between ticks — a lingering handle
+  keeps HWiNFO's mutex alive after HWiNFO exits, and a restarted HWiNFO then won't publish shared
+  memory until MyRsm is stopped (observed in practice). It also checks `dwSignature` for HWiNFO's
+  documented `DEAD` marker, keeps the last-known-good readings for `/`, and detaches from the
+  mapping immediately (re-attaching on the next tick) instead of parsing garbage. `poll()` re-reads the sensor list only when
   its count changes, but always rebuilds the reading list every tick. `toJson()` builds the JSON
   response and accepts `classRegex`/`nameRegex` query-param filters plus a `getMinMaxAvg=1` flag to
   include min/max/avg fields — the filter regexes are compiled once per request, not once per

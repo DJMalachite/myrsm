@@ -16,6 +16,51 @@ double nowSeconds()
 {
     return QDateTime::currentMSecsSinceEpoch() / 1000.0;
 }
+
+// HWiNFO's shared-memory mutex, held only for the duration of one read.
+//
+// Never kept open between ticks and never created by us: an open handle keeps
+// the named mutex alive after HWiNFO exits, and a restarted HWiNFO then
+// refuses to publish shared memory until every holder has closed it (seen in
+// practice: HWiNFO only came back once MyRsm was stopped). Opening it per
+// tick costs one syscall every poll interval.
+class HwinfoMutexLock {
+public:
+    enum class State { Locked, Unavailable, Timeout };
+
+    HwinfoMutexLock()
+    {
+        m_handle = OpenMutexA(SYNCHRONIZE, FALSE, HWiNFO_SENSORS_SM2_MUTEX);
+        if (!m_handle) {
+            m_error = GetLastError();
+            m_state = State::Unavailable;
+            return;
+        }
+        const DWORD r = WaitForSingleObject(m_handle, kMutexWaitMs);
+        if (r == WAIT_OBJECT_0 || r == WAIT_ABANDONED) {
+            m_state = State::Locked;
+        } else {
+            m_state = State::Timeout;
+        }
+    }
+    ~HwinfoMutexLock()
+    {
+        if (m_state == State::Locked)
+            ReleaseMutex(m_handle);
+        if (m_handle)
+            CloseHandle(m_handle);
+    }
+    HwinfoMutexLock(const HwinfoMutexLock&) = delete;
+    HwinfoMutexLock& operator=(const HwinfoMutexLock&) = delete;
+
+    State state() const { return m_state; }
+    DWORD error() const { return m_error; }
+
+private:
+    HANDLE m_handle = nullptr;
+    State m_state = State::Unavailable;
+    DWORD m_error = 0;
+};
 }
 
 MyRsm::MyRsm(int pollIntervalMs, double freshnessTimeoutS, QObject* parent)
@@ -23,15 +68,6 @@ MyRsm::MyRsm(int pollIntervalMs, double freshnessTimeoutS, QObject* parent)
     , m_shm(QNativeIpcKey(HWiNFO_SENSORS_MAP_FILE_NAME2))
     , m_freshnessTimeoutS(freshnessTimeoutS)
 {
-    // HWiNFO documents this mutex as required around shared-memory access.
-    // Opened once and reused so each poll only pays for a wait/release, not a
-    // fresh handle open every tick.
-    m_hwinfoMutex = CreateMutexA(nullptr, FALSE, HWiNFO_SENSORS_SM2_MUTEX);
-    if (!m_hwinfoMutex)
-        m_hwinfoMutex = OpenMutexA(SYNCHRONIZE, FALSE, HWiNFO_SENSORS_SM2_MUTEX);
-    if (!m_hwinfoMutex)
-        qWarning() << "Unable to create/open the HWiNFO shared memory mutex; reads may be unsynchronized.";
-
     poll();
     connect(&m_timer, &QTimer::timeout, this, &MyRsm::poll);
     m_timer.setInterval(pollIntervalMs);
@@ -42,52 +78,72 @@ MyRsm::~MyRsm()
 {
     if (m_shm.isAttached())
         m_shm.detach();
-    if (m_hwinfoMutex)
-        CloseHandle(m_hwinfoMutex);
+}
+
+void MyRsm::releaseSharedMemory()
+{
+    if (m_shm.isAttached()) {
+        m_shm.detach();
+        m_reloadSensors = true;
+    }
 }
 
 MyRsm::TickResult MyRsm::readSharedMemory(QString* error)
 {
     // Stay attached between polls instead of attaching/detaching every tick;
     // at 250ms that overhead adds up. Only re-attempt if we lost it or never
-    // got it (e.g. HWiNFO wasn't running yet at startup, or we detached
-    // because the data went stale).
+    // got it (e.g. HWiNFO wasn't running yet at startup, or we released it
+    // because HWiNFO went away / the data went stale).
     if (!m_shm.isAttached()) {
         if (!m_shm.attach(QSharedMemory::ReadOnly)) {
-            *error = QStringLiteral("Unable to attach to shared memory: ") + m_shm.errorString();
-            if (!m_attachFailWarned) {
-                qWarning() << "Unable to attach to shared memory:" << m_shm.errorString();
-                m_attachFailWarned = true;
+            const QString reason = m_shm.errorString();
+            *error = QStringLiteral("Unable to attach to shared memory: ") + reason;
+            // Log every change of reason, not just the first failure.
+            if (reason != m_lastAttachError) {
+                qWarning() << "Unable to attach to HWiNFO shared memory:" << reason;
+                m_lastAttachError = reason;
             }
             return TickResult::Failed;
         }
-        m_attachFailWarned = false;
+        if (!m_lastAttachError.isEmpty() || !m_everAttached)
+            qInfo() << "Attached to HWiNFO shared memory.";
+        m_lastAttachError.clear();
+        m_everAttached = true;
         // A (re-)attach may be a different HWiNFO instance with a different
         // sensor list of the same length; re-read it.
         m_reloadSensors = true;
     }
 
-    bool locked = false;
-    if (m_hwinfoMutex) {
-        DWORD waitResult = WaitForSingleObject(m_hwinfoMutex, kMutexWaitMs);
-        if (waitResult != WAIT_OBJECT_0 && waitResult != WAIT_ABANDONED) {
-            // HWiNFO is mid-write; skip this tick rather than risk a torn read.
-            return TickResult::MutexTimeout;
+    // HWiNFO documents this mutex as required around shared-memory access.
+    const HwinfoMutexLock lock;
+    switch (lock.state()) {
+    case HwinfoMutexLock::State::Timeout:
+        // HWiNFO is mid-write; skip this tick rather than risk a torn read.
+        return TickResult::MutexTimeout;
+    case HwinfoMutexLock::State::Unavailable:
+        if (!m_mutexWarned) {
+            qWarning() << "Unable to open the HWiNFO shared memory mutex (error" << lock.error()
+                       << "); reads may be unsynchronized.";
+            m_mutexWarned = true;
         }
-        locked = true;
+        break;
+    case HwinfoMutexLock::State::Locked:
+        m_mutexWarned = false;
+        break;
     }
 
     PHWiNFO_SENSORS_SHARED_MEM2 pHWiNFOMemory =
         (PHWiNFO_SENSORS_SHARED_MEM2) m_shm.data();
 
     if (pHWiNFOMemory->dwSignature == kSignatureDead) {
-        if (locked)
-            ReleaseMutex(m_hwinfoMutex);
         *error = QStringLiteral("HWiNFO shared memory reports inactive (DEAD signature)");
         if (!m_wasDead) {
             qWarning() << "HWiNFO shared memory reports inactive; keeping last known readings.";
             m_wasDead = true;
         }
+        // HWiNFO is shutting down: let go of its mapping right away so a
+        // restarted HWiNFO starts from a clean slate. Re-attached next tick.
+        releaseSharedMemory();
         return TickResult::Failed;
     }
     m_wasDead = false;
@@ -130,9 +186,7 @@ MyRsm::TickResult MyRsm::readSharedMemory(QString* error)
         });
     }
 
-    if (locked)
-        ReleaseMutex(m_hwinfoMutex);
-
+    // (The mutex is released when `lock` goes out of scope.)
     if (m_readings.isEmpty()) {
         *error = QStringLiteral("HWiNFO shared memory contains no readings");
         return TickResult::NoReadings;
@@ -189,10 +243,7 @@ void MyRsm::poll()
         }
         // Drop the mapping so the next tick re-attaches: picks up a restarted
         // HWiNFO and stops us keeping a dead instance's mapping alive.
-        if (m_shm.isAttached()) {
-            m_shm.detach();
-            m_reloadSensors = true;
-        }
+        releaseSharedMemory();
     } else if (m_wasStale) {
         qInfo() << "HWiNFO data is fresh again.";
         m_wasStale = false;

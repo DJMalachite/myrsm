@@ -60,14 +60,19 @@ private:
     // "/" as before, but counted as a failed poll, like the connector did).
     enum class TickResult { Success, NoReadings, MutexTimeout, Failed };
     TickResult readSharedMemory(QString* error);
+    // Detach from HWiNFO's mapping (re-attached on the next tick).
+    void releaseSharedMemory();
 
     QSharedMemory m_shm;
     QTimer m_timer;
     QList<Sensor> m_sensors;
     QList<ReadingData> m_readings;
     qint64 m_lastPollTime = 0;
-    HANDLE m_hwinfoMutex = nullptr;
-    bool m_attachFailWarned = false;
+    // HWiNFO's mutex is opened per read, never held between ticks (see
+    // HwinfoMutexLock in MyRsm.cpp).
+    QString m_lastAttachError;
+    bool m_everAttached = false;
+    bool m_mutexWarned = false;
     bool m_wasDead = false;
     bool m_reloadSensors = true;
     bool m_hasFreshData = false;

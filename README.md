@@ -92,8 +92,11 @@ values as live.** MyRsm now checks HWiNFO itself:
   `*_sensor_*` families are written, only the `*_exporter_*` ones.
 - A mutex wait timeout is counted as a failed poll, but on its own it doesn't change `source_up`
   or the cached data. Staleness only kicks in after the freshness window.
-- While stale, MyRsm detaches from the shared memory every tick and re-attaches on the next one.
-  A restarted HWiNFO is picked up without restarting MyRsm.
+- While stale, and as soon as HWiNFO marks the memory `DEAD`, MyRsm detaches from the shared
+  memory and re-attaches on the next tick. HWiNFO's mutex is only opened for the duration of each
+  read, never held in between. Holding it would keep the mutex alive after HWiNFO exits and stop a
+  restarted HWiNFO from publishing. A restarted HWiNFO is therefore picked up without restarting
+  MyRsm.
 - `last_http_status` is kept for compatibility: `200` when the last read succeeded, else `0`.
 
 The freshness timeout must be longer than HWiNFO's sensor polling period. If you raise HWiNFO's
