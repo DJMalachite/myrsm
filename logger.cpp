@@ -11,22 +11,27 @@ logger *logger::_inst = nullptr;
 logger::logger()
 {
   QMutexLocker locker(&m);
-  if (QString(BRANCH) == "main")
-    logFolderName = "C:/ProgramData/myrsm/";
-  else
-    logFolderName = QString() + "C:/ProgramData/myrsm_" + BRANCH + "/";
+  // %ProgramData%\MyRsm\logs for release builds (main branch or a tag),
+  // logs-<branch> for anything else so test builds don't mix with releases.
+  // The installer offers to remove %ProgramData%\MyRsm (config + logs).
+  const QString base =
+      QDir::fromNativeSeparators(qEnvironmentVariable("ProgramData", QStringLiteral("C:/ProgramData"))) +
+      QStringLiteral("/MyRsm/");
+#ifdef MYRSM_RELEASE_BUILD
+  const bool release = true;
+#else
+  const bool release = QString(BRANCH) == "main";
+#endif
+  logFolderName = release ? base + QStringLiteral("logs/") : base + QStringLiteral("logs-") + BRANCH + "/";
   max_logs_files = 7;
-  if (!QDir(logFolderName).exists())
-    QDir().mkdir(logFolderName);
+  std_err_log = qgetenv("STDERR_LOG") == "1";
+  QDir().mkpath(logFolderName);
 
   deleteOldLogs();   // delete old log files
   initLogFileName(); // create the logfile name
 
   if (_outFile.isOpen())
     qInstallMessageHandler(logger::handler);
-  std_err_log = false;
-  if (qgetenv("STDERR_LOG") == "1")
-    std_err_log = true;
 }
 
 logger::~logger() {}

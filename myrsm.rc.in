@@ -17,11 +17,11 @@ BEGIN
             VALUE "InternalName",     "internalname"
             VALUE "OriginalFilename", "myrsm.exe"
             VALUE "FileDescription",  "Data exporter: @COMMENT@"
-            VALUE "CompanyName",      "qdel"
+            VALUE "CompanyName",      "DJMalachite"
             VALUE "FileVersion",      "@VERSION_JOB@"
             VALUE "ProductName",      "MyRsm"
             VALUE "ProductVersion",   "@VERSION@"
-            VALUE "LegalCopyright",   "Private use only"
+            VALUE "LegalCopyright",   "Licensed under the GNU GPL v3"
         END
     END
 
