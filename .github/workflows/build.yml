@@ -53,6 +53,38 @@ jobs:
         shell: pwsh
         run: cmake --build build --config Release
 
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # prometheus_client is pinned: the parity test compares against its
+      # text exposition; requests is imported by the reference connector.
+      - name: Install Python test dependencies
+        shell: pwsh
+        run: python -m pip install --disable-pip-version-check prometheus_client==0.26.0 requests
+
+      - name: Unit tests (ctest)
+        shell: pwsh
+        run: ctest --test-dir build -C Release --output-on-failure
+
+      # Golden parity: every tests/fixtures/*.json through the verbatim
+      # reference connector (tools/reference) and through prom::render.
+      - name: Parity test vs reference connector
+        shell: pwsh
+        run: |
+          $env:PATH = "$env:QT_ROOT_DIR\bin;$env:PATH"
+          python tools/run_parity.py --renderer build/Release/myrsm_render_fixture.exe --keep parity-out
+          if ($LASTEXITCODE -ne 0) { throw "parity test failed" }
+
+      - name: Upload parity outputs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: parity-out-${{ github.run_number }}
+          path: parity-out/
+          if-no-files-found: ignore
+
       # Runs the install rules including the Qt deploy script (windeployqt),
       # producing a self-contained folder with myrsm.exe + Qt DLLs.
       - name: Deploy (portable folder)
@@ -66,6 +98,43 @@ jobs:
           if (-not $exe) { throw "myrsm.exe not found in deploy output" }
           & $exe.FullName --version --console
           if ($LASTEXITCODE -ne 0) { throw "--version exited with $LASTEXITCODE" }
+
+      # No HWiNFO on the runner: the routes must still answer, report stale /
+      # not-ready, and export no sensor series.
+      - name: Smoke test (HTTP routes without HWiNFO)
+        shell: pwsh
+        run: |
+          $exe = Get-ChildItem -Recurse "${{ github.workspace }}/deploy" -Filter myrsm.exe | Select-Object -First 1
+          $p = Start-Process -FilePath $exe.FullName -ArgumentList '--console', '--host-label', 'ci-runner' -PassThru -NoNewWindow
+          try {
+            $base = 'http://127.0.0.1:34567'
+            $ok = $false
+            for ($i = 0; $i -lt 30 -and -not $ok; $i++) {
+              try { $null = Invoke-WebRequest "$base/metrics" -UseBasicParsing -TimeoutSec 2; $ok = $true } catch { Start-Sleep -Milliseconds 500 }
+            }
+            if (-not $ok) { throw "myrsm did not answer on $base" }
+
+            $m = Invoke-WebRequest "$base/metrics" -UseBasicParsing
+            if ($m.StatusCode -ne 200) { throw "/metrics status $($m.StatusCode)" }
+            if ($m.Headers['Content-Type'] -ne 'text/plain; version=0.0.4; charset=utf-8') { throw "/metrics content-type '$($m.Headers['Content-Type'])'" }
+            foreach ($line in 'hwinfo_exporter_up 0.0', 'hwinfo_exporter_stale 1.0', 'hwinfo_exporter_data_age_seconds 1e+30') {
+              if (-not ($m.Content -split "`n" -contains $line)) { throw "missing '$line' in /metrics" }
+            }
+            if ($m.Content.Contains('_sensor_')) { throw "/metrics exported sensor series without HWiNFO" }
+
+            $h = Invoke-WebRequest "$base/healthz" -UseBasicParsing -SkipHttpErrorCheck
+            if ($h.StatusCode -ne 503) { throw "/healthz status $($h.StatusCode), expected 503" }
+            $j = $h.Content | ConvertFrom-Json
+            if ($j.exporter_up -ne $false -or $j.stale -ne $true) { throw "/healthz body: $($h.Content)" }
+            $r = Invoke-WebRequest "$base/readyz" -UseBasicParsing -SkipHttpErrorCheck
+            if ($r.StatusCode -ne 503) { throw "/readyz status $($r.StatusCode), expected 503" }
+
+            $root = Invoke-WebRequest "$base/" -UseBasicParsing
+            if ($root.Content.Trim() -ne '[]') { throw "/ returned '$($root.Content)'" }
+            Write-Host "HTTP smoke test passed"
+          } finally {
+            Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue
+          }
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4

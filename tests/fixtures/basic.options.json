@@ -1,0 +1,14 @@
+[
+  {"name": "default", "expect_sensor_series": 36},
+  {"name": "shadow-prefix", "metric_prefix": "hwinfo_shadow", "host_label": "Second-PC", "expect_sensor_series": 36},
+  {"name": "odd-prefix", "metric_prefix": "  HWiNFO-Shadow #2 ", "expect_sensor_series": 36},
+  {"name": "compat-source-label", "compat_source_label": true, "expect_sensor_series": 36},
+  {"name": "include-classes", "include_classes": "gpu, S.M.A.R.T.", "expect_sensor_series": 12},
+  {"name": "exclude-sensors", "exclude_sensors": "clock,TEMPERATURE", "expect_sensor_series": 31},
+  {"name": "include-and-exclude", "include_sensors": "rate", "exclude_classes": "network", "expect_sensor_series": 4},
+  {"name": "include-apps-nomatch", "include_apps": "aida64", "expect_sensor_series": 0},
+  {"name": "exclude-apps-hwinfo", "exclude_apps": "hwinfo", "expect_sensor_series": 0},
+  {"name": "stale", "data_age": 21, "expect_sensor_series": 0},
+  {"name": "fresh-at-timeout", "data_age": 20, "expect_sensor_series": 36},
+  {"name": "short-timeout-stale", "freshness_timeout": 0.5, "expect_sensor_series": 0}
+]
