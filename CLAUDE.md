@@ -20,9 +20,18 @@ cmake -B build -DCMAKE_PREFIX_PATH=<path-to-Qt6-cmake-dir>
 cmake --build build
 ```
 
-There is no separate test target/framework in this repo; `test.http` is a manual scratch file for
-exercising the HTTP endpoint with an HTTP-client extension (e.g. VS Code REST Client / JetBrains
-`.http` runner), not an automated test suite.
+Tests:
+- `tst_promexporter` (Qt Test, [tests/tst_promexporter.cpp](tests/tst_promexporter.cpp)) — run with
+  `ctest --test-dir build -C Release --output-on-failure`. Covers the exporter port and asserts the
+  `/` JSON is byte-identical to a verbatim copy of the pre-refactor `toJson()`.
+- Golden parity test: `python tools/run_parity.py --renderer build/Release/myrsm_render_fixture.exe`
+  (needs `pip install prometheus_client==0.26.0 requests`). Renders every `tests/fixtures/*.json`
+  through the verbatim reference connector in [tools/reference/](tools/reference/) and through
+  `myrsm_render_fixture` (same code as `/metrics`) with a frozen poll state; any series/value
+  difference fails. Don't edit `tools/reference/hwinfo_prom_exporter_2fb02f5.py` — it's the oracle.
+- `-DMYRSM_BUILD_APP=OFF` builds only `myrsm_core` + tests (needs just Qt Core/Test, no
+  HttpServer/WebSockets/ImageMagick) — handy for a local build when Qt lacks those modules.
+- `test.http` is still a manual scratch file for an HTTP-client extension.
 
 Versioning: `VERSION` and `PROJECT_VERSION_NAME` are derived from CI env vars (`CI_PIPELINE_ID`,
 `CI_JOB_ID`, `CI_COMMIT_REF_SLUG`); locally they fall back to `1` / `localbuild`. These feed into
@@ -31,15 +40,24 @@ Versioning: `VERSION` and `PROJECT_VERSION_NAME` are derived from CI env vars (`
 CI: [.github/workflows/build.yml](.github/workflows/build.yml) builds on `windows-latest` (Qt via
 `jurplel/install-qt-action`, modules `qthttpserver qtwebsockets`), maps GitHub context onto the
 GitLab-style env vars above (`run_number` → `CI_PIPELINE_ID`/`CI_JOB_ID`, slugified `ref_name` →
-`CI_COMMIT_REF_SLUG`), runs the install/deploy script to produce a portable folder with Qt DLLs,
-smoke-tests `--version`, and uploads it as the `myrsm-win64-<run>` artifact. There's no local-Qt
+`CI_COMMIT_REF_SLUG`), runs `ctest` and the parity test, runs the install/deploy script to produce
+a portable folder with Qt DLLs, smoke-tests `--version` and the HTTP routes (no HWiNFO on the
+runner, so `/metrics` must report stale and `/healthz` 503), and uploads it as the
+`myrsm-win64-<run>` artifact. There's no local-Qt
 assumption for development — pushing a branch is the expected way to get a build.
 
 ## Running
 
 ```
 myrsm.exe [--console] [--httpport <port>] [--wsport <port>] [--pollms <ms>] [--version]
+          [--metric-prefix <p>] [--host-label <name>] [--freshness-timeout <s>]
+          [--include-sensors|--exclude-sensors|--include-classes|--exclude-classes|--include-apps|--exclude-apps <csv>]
+          [--compat-source-label]
 ```
+
+- The Prometheus options only affect `/metrics` and `/healthz`/`/readyz` (defaults: prefix
+  `hwinfo`, host `%COMPUTERNAME%`, freshness `20` s, no filters, no `source` label). See
+  [README.md](README.md) for semantics; they mirror the Python connector's env vars.
 
 - Default ports: HTTP `34567`... but note the *actual* HTTP route is bound via `QHttpServer::bind`
   onto the raw `QTcpServer`, and `test.http` connects on `34569` — check `tcpPortArg`/`wsPortArg`
@@ -76,6 +94,19 @@ myrsm.exe [--console] [--httpport <port>] [--wsport <port>] [--pollms <ms>] [--v
   response and accepts `classRegex`/`nameRegex` query-param filters plus a `getMinMaxAvg=1` flag to
   include min/max/avg fields — the filter regexes are compiled once per request, not once per
   reading, which matters once requests are arriving every 250ms across a few hundred readings.
+  `toJson()` serialises `snapshot()` (a list of `SnapshotRow`, see [RsmTypes.hpp](RsmTypes.hpp)),
+  and `/metrics` is rendered from the same `snapshot()`, so the two can't drift apart. `poll()` also
+  maintains `PollHealth` (attempt/success timestamps, counters, last error): a tick only counts as
+  *fresh* when HWiNFO's `poll_time` changed, and once nothing fresh has arrived for the freshness
+  timeout it detaches the shared memory every tick so a restarted HWiNFO is re-attached (see
+  README "Freshness"). A mutex timeout counts as a failed poll but changes nothing else.
+- **[PromExporter.hpp](PromExporter.hpp) / [PromExporter.cpp](PromExporter.cpp)** — Windows-free
+  port of the HWINFOtoPrometheusConnector @ `2fb02f5` output contract: `cleanText` (mojibake
+  repair), `sanitizeName`, `normalizeUnit`, `safeFloat` (Python `float()` semantics), `buildRows`
+  (filters + `occurrence`), `render` (text format 0.0.4, connector's families/HELP, no sensor
+  families when stale), `renderHealthJson`. Python string semantics (`str.strip()` whitespace set,
+  `repr(float)`) are reproduced deliberately — label values must match the connector byte-for-byte
+  or dashboards break. Don't "improve" them without a shadow comparison.
 - **[hwisenssm2.h](hwisenssm2.h)** — vendored copy of HWiNFO's public shared-memory ABI (structs are
   `#pragma pack(1)` — don't reformat/reorder these; they must binary-match HWiNFO's layout). Treat
   as a third-party interface header, not application code.
@@ -86,7 +117,8 @@ myrsm.exe [--console] [--httpport <port>] [--wsport <port>] [--pollms <ms>] [--v
   (`runAsService()` calls `logger::init()`); console mode relies on Qt's default stderr logging via
   the `qSetMessagePattern` set in `main()`. Set env var `STDERR_LOG=1` to also mirror log output to
   stderr when the file logger is active.
-- **HTTP/WebSocket surface** — a single route (`/`) on both transports. Query params act as filters
+- **HTTP/WebSocket surface** — `/` on both transports, plus HTTP-only `/metrics`, `/healthz`
+  and `/readyz` (200 when exporter_up, else 503; query params ignored). On `/`, query params act as filters
   and are forwarded straight into `MyRsm::toJson()`; the WebSocket path additionally pushes updates
   to connected clients on every `MyRsm::newData` signal (i.e. every poll tick), replaying the same
   filtered payload each time using the query params captured at connection time.
