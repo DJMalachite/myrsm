@@ -6,6 +6,11 @@
 #include <QUrlQuery>
 #include <QTcpServer>
 #include <QHttpServer>
+#include <QHttpServerResponse>
+#include <QHttpServerResponder>
+#include <QDateTime>
+#include <QSysInfo>
+#include <cmath>
 #include <QWebSocketServer>
 #include <QWebSocket>
 #include <windows.h>
@@ -16,6 +21,7 @@
 using namespace Qt::Literals::StringLiterals;
 
 #include "MyRsm.hpp"
+#include "PromExporter.hpp"
 
 #define SERVICE_NAME  _T("MyRsm")
 
@@ -35,11 +41,14 @@ int pollIntervalMsArg = 250;
 constexpr int kMinPollIntervalMs = 50;
 bool runAsServiceFlag = false;
 bool stop = false;
+prom::Options promOptions;
 
 void loadConfigFromCli(QStringList a) {
     QCommandLineParser parser;
     QCommandLineOption verboseOption(QStringList() << "v" << "version", "Display versions and exit.");
     QCommandLineOption consoleOption(QStringList() << "c" << "console", "Run as console application.");
+    QCommandLineOption compatSourceOption("compat-source-label",
+        "Append source=\"http\" to sensor series (matches the post-MQTT connector's extra label).");
 
     parser.addOptions({
             { "httpport", QCoreApplication::translate("main", "The port the http server listens on."),
@@ -48,11 +57,43 @@ void loadConfigFromCli(QStringList a) {
               "wsport" },
             { "pollms", QCoreApplication::translate("main", "Shared memory poll interval in milliseconds (min 50, default 250)."),
               "pollms" },
+            { "metric-prefix", "Prometheus metric name prefix (default hwinfo).", "prefix" },
+            { "host-label", "Value of the host label on /metrics (default %COMPUTERNAME%).", "name" },
+            { "freshness-timeout", "Seconds without a fresh HWiNFO sample before /metrics drops sensor series (default 20).",
+              "seconds" },
+            { "include-sensors", "Comma-separated, case-insensitive substrings; only matching sensor names are exported.", "list" },
+            { "exclude-sensors", "Comma-separated, case-insensitive substrings; matching sensor names are not exported.", "list" },
+            { "include-classes", "Comma-separated, case-insensitive substrings; only matching sensor classes are exported.", "list" },
+            { "exclude-classes", "Comma-separated, case-insensitive substrings; matching sensor classes are not exported.", "list" },
+            { "include-apps", "Comma-separated, case-insensitive substrings; only matching sensor apps are exported.", "list" },
+            { "exclude-apps", "Comma-separated, case-insensitive substrings; matching sensor apps are not exported.", "list" },
+            compatSourceOption,
             verboseOption,
             consoleOption
     });
     parser.addHelpOption();
     parser.process(a);
+    if (parser.isSet("metric-prefix"))
+        promOptions.metricPrefix = parser.value("metric-prefix");
+    promOptions.hostLabel = parser.isSet("host-label") ? parser.value("host-label")
+                                                       : qEnvironmentVariable("COMPUTERNAME");
+    if (promOptions.hostLabel.isEmpty() && !parser.isSet("host-label"))
+        promOptions.hostLabel = QSysInfo::machineHostName();
+    if (parser.isSet("freshness-timeout")) {
+        bool ok = false;
+        const double t = parser.value("freshness-timeout").toDouble(&ok);
+        if (ok && t > 0 && std::isfinite(t))
+            promOptions.freshnessTimeout = t;
+        else
+            qWarning() << "Ignoring invalid --freshness-timeout" << parser.value("freshness-timeout");
+    }
+    promOptions.includeSensors = prom::parseFilterList(parser.value("include-sensors"));
+    promOptions.excludeSensors = prom::parseFilterList(parser.value("exclude-sensors"));
+    promOptions.includeClasses = prom::parseFilterList(parser.value("include-classes"));
+    promOptions.excludeClasses = prom::parseFilterList(parser.value("exclude-classes"));
+    promOptions.includeApps = prom::parseFilterList(parser.value("include-apps"));
+    promOptions.excludeApps = prom::parseFilterList(parser.value("exclude-apps"));
+    promOptions.compatSourceLabel = parser.isSet(compatSourceOption);
     if (!parser.value("httpport").isEmpty())
         tcpPortArg = parser.value("httpport").toUShort();
     if (!parser.value("wsport").isEmpty())
@@ -76,9 +117,27 @@ void loadConfigFromCli(QStringList a) {
     }
 }
 
+static double nowSeconds()
+{
+    return QDateTime::currentMSecsSinceEpoch() / 1000.0;
+}
+
+// /healthz and /readyz: the connector's JSON shape, 200 if exporter_up else 503.
+static QHttpServerResponse healthResponse(const MyRsm* rsm)
+{
+    const double now = nowSeconds();
+    const QList<prom::Row> rows = prom::buildRows(rsm->snapshot(), promOptions);
+    const prom::Health health = prom::healthFromPoll(rsm->health(), int(rows.size()));
+    bool up = false;
+    const QByteArray body = prom::renderHealthJson(health, promOptions, now, &up);
+    return QHttpServerResponse(QByteArray(prom::kHealthContentType), body,
+                               up ? QHttpServerResponder::StatusCode::Ok
+                                  : QHttpServerResponder::StatusCode::ServiceUnavailable);
+}
+
 int configure()
 {
-    auto rsm = new MyRsm(pollIntervalMsArg, 20.0, QCoreApplication::instance());
+    auto rsm = new MyRsm(pollIntervalMsArg, promOptions.freshnessTimeout, QCoreApplication::instance());
     auto server = new QTcpServer(QCoreApplication::instance());
     auto httpServer = new QHttpServer(QCoreApplication::instance());
     auto wsServer = new QWebSocketServer(QStringLiteral("MyRsm WebSocket Server"), QWebSocketServer::NonSecureMode, QCoreApplication::instance());
@@ -93,6 +152,22 @@ int configure()
         if (!items.isEmpty())
             qDebug() << "New HTTP connection from" << items;
         return QJsonDocument(rsm->toJson(items)).toJson(QJsonDocument::Compact);
+    });
+
+    // Prometheus exposition (port of the HWINFOtoPrometheusConnector output).
+    // Query parameters are ignored; filtering comes from the CLI options.
+    httpServer->route("/metrics", QHttpServerRequest::Method::Get, [rsm](const QHttpServerRequest &) {
+        const double now = nowSeconds();
+        const QList<prom::Row> rows = prom::buildRows(rsm->snapshot(), promOptions);
+        const prom::Health health = prom::healthFromPoll(rsm->health(), int(rows.size()));
+        return QHttpServerResponse(QByteArray(prom::kContentType),
+                                   prom::render(rows, health, promOptions, now));
+    });
+    httpServer->route("/healthz", QHttpServerRequest::Method::Get, [rsm](const QHttpServerRequest &) {
+        return healthResponse(rsm);
+    });
+    httpServer->route("/readyz", QHttpServerRequest::Method::Get, [rsm](const QHttpServerRequest &) {
+        return healthResponse(rsm);
     });
 
     if (!httpServer->bind(server)) {
